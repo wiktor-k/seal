@@ -1,0 +1,324 @@
+const toBase64 = arrayBuffer => btoa(String.fromCharCode.apply(null, new Uint8Array(arrayBuffer)));
+
+const uint8ArrayToBase64Url = uint8Array => toBase64(uint8Array).replace(/\=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+
+function base64UrlToUint8Array(base64UrlData) {
+    const padding = '='.repeat((4 - base64UrlData.length % 4) % 4);
+    const base64 = (base64UrlData + padding).replace(/\-/g, '+').replace(/_/g, '/');
+
+    const rawData = window.atob(base64);
+    return new Uint8Array(rawData.length).map((_, i) => rawData.charCodeAt(i));
+}
+
+class HKDF {
+    constructor(ikm, salt) {
+        this._ikm = ikm;
+        this._salt = salt;
+    }
+
+    async generate(info, byteLength) {
+    const fullInfoBuffer = new Uint8Array(info.byteLength + 1);
+    fullInfoBuffer.set(info, 0);
+    fullInfoBuffer.set(new Uint8Array(1).fill(1), info.byteLength);
+
+    const prk = await HKDF.signHMAC(this._salt, this._ikm);
+    const nextPrk = await HKDF.signHMAC(prk, fullInfoBuffer);
+    return nextPrk.slice(0, byteLength);
+}
+
+    static async signHMAC(ikm, input) {
+    const key = await crypto.subtle.importKey('raw', ikm,
+        {name: 'HMAC', hash: 'SHA-256'}, false, ['sign'])
+    return crypto.subtle.sign('HMAC', key, input);
+}
+}
+
+const Uint8concat = (...arrays) => Uint8Array.of(...arrays.reduce((a, b) => a.concat(...b), []));
+
+// Length, in bytes, of a P-256 field element. Expected format of the private key.
+const PRIVATE_KEY_BYTES = 32;
+
+// Length, in bytes, of a P-256 public key in uncompressed EC form per SEC 2.3.3. This sequence must
+// start with 0x04. Expected format of the public key.
+const PUBLIC_KEY_BYTES = 65;
+
+const utf8encode = (() => {
+        const utf8Encoder = new TextEncoder('utf-8');
+return text => utf8Encoder.encode(text);
+})();
+
+class EncryptionHelper {
+    constructor(serverKeys, salt) {
+        this._serverKeys = serverKeys;
+        this._salt = salt;
+    }
+
+    async getSharedSecret(publicKeyString) {
+    const publicKey = await EncryptionHelper.decodePublicKey(publicKeyString);
+    const algorithm = { name: 'ECDH', namedCurve: 'P-256', public: publicKey };
+    return crypto.subtle.deriveBits(algorithm, this._serverKeys.privateKey, 256);
+}
+
+    async generateContext(publicKeyString) {
+    const publicKey = await EncryptionHelper.decodePublicKey(publicKeyString);
+    const clientPublicKey = await EncryptionHelper.exportPublicKey(publicKey);
+    const serverPublicKey = await EncryptionHelper.exportPublicKey(this._serverKeys.publicKey);
+
+    const createByteLengthArray = key => Uint8Array.of(0x00, key.byteLength);
+
+    return Uint8concat(
+        utf8encode('P-256'),
+        Uint8Array.of(0), // padding
+        createByteLengthArray(clientPublicKey),
+        clientPublicKey,
+        createByteLengthArray(serverPublicKey),
+        serverPublicKey
+    );
+}
+
+    async generateInfo(publicKeyString, text) {
+    return Uint8concat(
+        utf8encode(text),
+        Uint8Array.of(0), // padding
+        await this.generateContext(publicKeyString)
+);
+}
+
+    generateCEKInfo(publicKeyString) {
+        return this.generateInfo(publicKeyString, 'Content-Encoding: aesgcm');
+    }
+
+    generateNonceInfo(publicKeyString) {
+        return this.generateInfo(publicKeyString, 'Content-Encoding: nonce');
+    }
+
+    async generatePRK(subscription) {
+    return new HKDF(
+        await this.getSharedSecret(subscription.keys.p256dh),
+        base64UrlToUint8Array(subscription.keys.auth))
+.generate(utf8encode('Content-Encoding: auth\0'), 32);
+}
+
+    async generateEncryptionKeys(subscription) {
+    const [prk, cekInfo, nonceInfo] = await Promise.all([
+        this.generatePRK(subscription),
+        this.generateCEKInfo(subscription.keys.p256dh),
+        this.generateNonceInfo(subscription.keys.p256dh)
+    ]);
+
+    const hkdf = new HKDF(prk, this._salt);
+    const contentEncryptionKey = await hkdf.generate(cekInfo, 16);
+    const nonce = await hkdf.generate(nonceInfo, 12);
+    return { contentEncryptionKey, nonce };
+}
+
+    async encryptMessage(subscription, payload) {
+    const encryptionKeys = await this.generateEncryptionKeys(subscription);
+    const contentEncryptionCryptoKey = await crypto.subtle.importKey('raw',
+        encryptionKeys.contentEncryptionKey, 'AES-GCM', true,
+        ['decrypt', 'encrypt']);
+    const paddingBytes = 0;
+    const paddingUnit8Array = new Uint8Array(2 + paddingBytes);
+    const payloadUint8Array = utf8encode(payload);
+    const recordUint8Array = Uint8concat(paddingUnit8Array, payloadUint8Array);
+    const algorithm = {
+        name: 'AES-GCM',
+        tagLength: 128,
+        iv: encryptionKeys.nonce
+    };
+
+    const encryptedPayloadArrayBuffer = await crypto.subtle.encrypt(
+        algorithm, contentEncryptionCryptoKey, recordUint8Array);
+    const publicServerKey = await EncryptionHelper.exportPublicKey(this._serverKeys.publicKey);
+    return {
+        cipherText: encryptedPayloadArrayBuffer,
+        salt: uint8ArrayToBase64Url(this._salt),
+        publicServerKey: uint8ArrayToBase64Url(publicServerKey)
+    };
+}
+
+    static async exportPublicKey(pubKey) {
+    const publicJwk = await crypto.subtle.exportKey('jwk', pubKey)
+    return Uint8concat([0x04], base64UrlToUint8Array(publicJwk.x), base64UrlToUint8Array(publicJwk.y));
+}
+
+    static async decodePublicKey(pubKey) {
+    if (!(typeof pubKey === 'string')) {
+        throw new Error('The publicKey is expected to be an String.');
+    }
+
+    const publicKeyUnitArray = base64UrlToUint8Array(pubKey);
+    if (publicKeyUnitArray.byteLength !== PUBLIC_KEY_BYTES) {
+        throw new Error('The publicKey is expected to be ' + PUBLIC_KEY_BYTES + ' bytes.');
+    }
+
+    const publicBuffer = new Uint8Array(publicKeyUnitArray);
+    if (publicBuffer[0] !== 0x04) {
+        throw new Error('The publicKey is expected to start with an 0x04 byte.');
+    }
+
+    const jwk = {
+        kty: 'EC',
+        crv: 'P-256',
+        x: uint8ArrayToBase64Url(publicBuffer.subarray(1, 33)),
+        y: uint8ArrayToBase64Url(publicBuffer.subarray(33, 65)),
+        ext: true
+    };
+
+    return await crypto.subtle.importKey('jwk', jwk, {
+        name: 'ECDH', namedCurve: 'P-256'}, true, []);
+}
+}
+
+
+class EncryptionHelperFactory {
+    static async generateHelper() {
+    const serverKeys = await EncryptionHelperFactory.generateKeys();
+    return new EncryptionHelper(serverKeys, crypto.getRandomValues(new Uint8Array(16)));
+}
+
+    static generateKeys() {
+        // True is to make the keys extractable
+        return crypto.subtle.generateKey({name: 'ECDH', namedCurve: 'P-256'},
+            true, ['deriveBits']);
+    }
+
+    static async createVapidAuthHeader(vapidKeys, audience, subject, exp) {
+    if (typeof exp !== 'number') {
+        // The `exp` field will contain the current timestamp in UTC plus twelve hours.
+        exp = Math.floor((Date.now() / 1000) + 12 * 60 * 60);
+    }
+
+    // Ensure the audience is just the origin
+    audience = new URL(audience).origin;
+
+    // The unsigned token is the concatenation of the URL-safe base64 encoded header and body.
+    const unsignedToken = [{
+            typ: 'JWT',
+            alg: 'ES256'
+        }, {
+            aud: audience,
+            exp,
+            sub: subject
+        }].map(part => uint8ArrayToBase64Url(utf8encode(JSON.stringify(part)))).join('.');
+
+    // Sign the |unsignedToken| using ES256 (SHA-256 over ECDSA).
+    const key = {
+        kty: 'EC',
+        crv: 'P-256',
+        x: uint8ArrayToBase64Url(vapidKeys.publicKey.subarray(1, 33)),
+        y: uint8ArrayToBase64Url(vapidKeys.publicKey.subarray(33, 65)),
+        d: uint8ArrayToBase64Url(vapidKeys.privateKey)
+    };
+
+    // Sign the |unsignedToken| with the server's private key to generate the signature.
+    const privateKey = await crypto.subtle.importKey('jwk', key, {
+        name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign'])
+    const signature = await crypto.subtle.sign({
+        name: 'ECDSA',
+        hash: {
+            name: 'SHA-256'
+        }
+    }, privateKey, utf8encode(unsignedToken));
+    const jsonWebToken = unsignedToken + '.' + uint8ArrayToBase64Url(new Uint8Array(signature));
+    const p256ecdsa = uint8ArrayToBase64Url(vapidKeys.publicKey);
+
+    return { authorization: jsonWebToken, p256ecdsa };
+}
+}
+
+class Controller {
+    constructor() {
+        this._applicationKeys = {
+            publicKey: base64UrlToUint8Array('BDd3_hVL9fZi9Ybo2UUzA284WG5FZR30_95YeZJsiA' +
+                'pwXKpNcF1rRPF3foIiBHXRdJI2Qhumhf6_LFTeZaNndIo'),
+            privateKey: base64UrlToUint8Array('xKZKYRNdFFn8iQIF2MH54KTfUHwH105zBdzMR7SI3xI')
+        };
+    }
+
+    async sendPushMessage(subscription, payloadText) {
+    let payloadPromise = Promise.resolve(null);
+    if (payloadText && payloadText.trim().length > 0) {
+        payloadPromise = EncryptionHelperFactory.generateHelper()
+                .then(encryptionHelper => encryptionHelper.encryptMessage(
+                JSON.parse(JSON.stringify(subscription)), payloadText));
+    }
+
+    // Vapid support
+    const vapidPromise = EncryptionHelperFactory.createVapidAuthHeader(
+        this._applicationKeys,
+        subscription.endpoint,
+        'mailto:simple-push-demo@gauntface.co.uk');
+
+    const [ payload, vapidHeaders ] = await Promise.all([ payloadPromise, vapidPromise ])
+    let requestInfo = this.getWebPushInfo(subscription, payload, vapidHeaders);
+
+    // Some push services don't allow CORS so have to forward
+    // it to a different server to make the request which does support
+    // CORs
+
+    this.sendRequestToProxyServer(requestInfo);
+}
+
+    getWebPushInfo(subscription, payload, vapidHeaders) {
+        let body = null;
+        const headers = {};
+        headers.TTL = 60;
+
+        if (payload) {
+            body = payload.cipherText;
+
+            headers.Encryption = `salt=${payload.salt}`;
+            headers['Crypto-Key'] = `dh=${payload.publicServerKey}`;
+            headers['Content-Encoding'] = 'aesgcm';
+        } else {
+            headers['Content-Length'] = 0;
+        }
+
+        if (vapidHeaders) {
+            headers.Authorization = `WebPush ${vapidHeaders.authorization}`;
+
+            if (headers['Crypto-Key']) {
+                headers['Crypto-Key'] = `${headers['Crypto-Key']}; p256ecdsa=${vapidHeaders.p256ecdsa}`;
+            } else {
+                headers['Crypto-Key'] = `p256ecdsa=${vapidHeaders.p256ecdsa}`;
+            }
+        }
+
+        const response = { headers, endpoint: subscription.endpoint };
+
+        if (body) {
+            response.body = body;
+        }
+
+        return response;
+    }
+
+    async sendRequestToProxyServer(requestInfo) {
+    const request = { method: 'post' };
+
+    // Can't send a stream like is needed for web push protocol,
+    // so needs to convert it to base 64 here and the server will
+    // convert back and pass as a stream
+    if (requestInfo.body instanceof ArrayBuffer) {
+        requestInfo.body = toBase64(requestInfo.body);
+    }
+
+    request.body = JSON.stringify(requestInfo);
+
+    try {
+        const response = await fetch('https://simple-push-demo.appspot.com/api/v2/sendpush', request)
+        if (!response.ok) {
+            throw new Error('Failed to send push message via web push protocol: ' + response.status);
+        }
+    } catch (e) {
+        console.error('Failed web push response: ', e);
+    }
+}
+}
+
+window.subscription = {"endpoint":"https://fcm.googleapis.com/fcm/send/e2_v_hkHkOM:APA91bFemC_mZldvLF3ECxXag7f_npqehsLXE30ByH_XhSKLHyyG_ARLZgEYIPTug2gElWacTUyVJeTOdB9qgsOtC1dSsz21cjz6E5X58hFSUTo8WkjzGGgqGuzSmzP4NvbC8Hw4ur2r","keys":{"p256dh":"BKNOR9yOz-auRVdWKykuSLezu8SgAzib_CJsFs17F04K58G9FmkcbJVUugJ5_9ugoUFgX6-L0E9aDuyBcbfuTi8=","auth":"OVFaJXcAmJ6MB4O-9rB-zA=="}};
+
+window.controller = new Controller;
+// send using:
+// controller.sendPushMessage(subscription, 'text message')
