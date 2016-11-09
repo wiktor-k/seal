@@ -1,12 +1,47 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Web push</title>
+<title>Send encrypted message</title>
 <!--empty icon-->
 <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+
+<style>
+    #help {
+        display: none;
+        margin: 10px 0;
+    }
+
+    #help:target {
+        display: block;
+    }
+</style>
 </head>
 <body>
-<h1>Web Push</h1>
+<h1>Send encrypted message</h1>
+
+<form>
+    <p><label for="subscription">Receiver subscription (<a href="#help">Where can I find it?</a>):</label></p>
+    <div id="help">
+        <ol>
+            <li>Receiver go to <a href="https://gauntface.github.io/simple-push-demo/">Push Demo</a></li>
+            <li>Receiver execute following code in a browser console:</li>
+            <ul>
+                <li><code>navigator.serviceWorker.getRegistration().then(reg=>reg.pushManager.getSubscription()).then(sub=>window.open('data:text/plain,'+JSON.stringify(sub)),console.error.bind(console));</code></li>
+            </ul>
+            <li>Receiver open a blocked pop up window</li>
+            <li>Receiver share JSON value</li>
+            <li>Copy shared value into <em>Receiver subscription</em> field</li>
+        </ol>
+        <a href="#">Hide</a>
+    </div>
+    <textarea id="subscription" rows="4" cols="50"></textarea>
+
+    <p><label for="message">Message:</label></p>
+    <textarea id="message" rows="4" cols="50"></textarea>
+
+    <p><button id="send" type="button">Send</button></p>
+</form>
+
 <script>
 (function() {
 
@@ -329,11 +364,17 @@ class Controller {
   }
 }
 
-window.subscription = {"endpoint":"https://fcm.googleapis.com/fcm/send/e2_v_hkHkOM:APA91bFemC_mZldvLF3ECxXag7f_npqehsLXE30ByH_XhSKLHyyG_ARLZgEYIPTug2gElWacTUyVJeTOdB9qgsOtC1dSsz21cjz6E5X58hFSUTo8WkjzGGgqGuzSmzP4NvbC8Hw4ur2r","keys":{"p256dh":"BKNOR9yOz-auRVdWKykuSLezu8SgAzib_CJsFs17F04K58G9FmkcbJVUugJ5_9ugoUFgX6-L0E9aDuyBcbfuTi8=","auth":"OVFaJXcAmJ6MB4O-9rB-zA=="}};
-
 window.controller = new Controller;
-// send using:
-// controller.sendPushMessage(subscription, 'text message')
+
+document.addEventListener("DOMContentLoaded", () => {
+    document.querySelector("#send").addEventListener("click", () => {
+        const subscription = JSON.parse(document.querySelector("#subscription").value);
+        const message = document.querySelector("#message").value;
+
+        console.log("Sending message...", subscription, message);
+        controller.sendPushMessage(subscription, message);
+    });
+});
 }());
 </script>
 </body>
