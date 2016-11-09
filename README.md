@@ -17,4 +17,4 @@ The serverless chat with end-to-end encryption.
         http://localhost:8080/
 1. Enter receiver subscription
 1. Enter message
-1. Press send
+1. Press _Send_ button
