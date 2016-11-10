@@ -4,6 +4,7 @@
 <title>Send encrypted message</title>
 <!--empty icon-->
 <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+<link rel="manifest" href="./manifest.json">
 
 <style>
     #help {
@@ -23,13 +24,7 @@
     <p><label for="subscription">Receiver subscription (<a href="#help">Where can I find it?</a>):</label></p>
     <div id="help">
         <ol>
-            <li>Receiver go to <a href="https://gauntface.github.io/simple-push-demo/">Push Demo</a></li>
-            <li>Receiver execute following code in a browser console:</li>
-            <ul>
-                <li><code>navigator.serviceWorker.getRegistration().then(reg=>reg.pushManager.getSubscription()).then(sub=>window.open('data:text/plain,'+JSON.stringify(sub)),console.error.bind(console));</code></li>
-            </ul>
-            <li>Receiver open a blocked pop up window</li>
-            <li>Receiver share JSON value</li>
+            <li><textarea id="subscription" rows="10" cols="120"></textarea></li>
             <li>Copy shared value into <em>Receiver subscription</em> field</li>
         </ol>
         <a href="#">Hide</a>
@@ -375,6 +370,18 @@ document.addEventListener("DOMContentLoaded", () => {
         controller.sendPushMessage(subscription, message);
     });
 });
+
+(async function createSubscription() {
+  const registration = await navigator.serviceWorker.register('./service-worker.js');
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: controller._applicationKeys.publicKey
+    });
+  }
+  document.getElementById('subscription').value = JSON.stringify(subscription, null, 2);
+})().catch(console.error.bind(console));
 }());
 </script>
 </body>
